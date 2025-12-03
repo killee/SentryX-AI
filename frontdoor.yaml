@@ -1,0 +1,996 @@
+substitutions:
+  devicename: frontdoor
+  friendly_name: "Haustüre Einlass"
+
+esphome:
+  name: ${devicename}
+
+  comment: "SentryX AI super duper Tür AI Eintritts und Begrüßungszauberei"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf      
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: ${devicename} Hotspot
+    password: !secret wifi_password
+
+captive_portal:
+
+logger:
+  level: DEBUG
+  baud_rate: 0        # keine serielle Ausgabe → UART0 frei
+
+ota:
+  password: !secret esp_password
+  platform: esphome
+
+external_components:
+  - source: github://pr#12195
+    components: [hlk_fm22x]
+    refresh: 1h
+
+api:
+  encryption:
+    key: !secret api_key
+
+  actions:
+  - action: enroll
+    variables:
+      name: string
+      direction: int
+    then:
+      - hlk_fm22x.enroll:
+          name: !lambda 'return name;'
+          direction: !lambda 'return direction;'
+  - action: scan
+    then:
+      - hlk_fm22x.scan:
+  - action: delete
+    variables:
+      face_id: int
+    then:
+      - hlk_fm22x.delete:
+          face_id: !lambda 'return face_id;'
+  - action: delete_all
+    then:
+      - hlk_fm22x.delete_all:
+  - action: reset
+    then:
+      - hlk_fm22x.reset:
+  # NEU: Enroll-Status zurücksetzen (vor „Enroll komplett“)
+  - action: reset_enroll_status
+    then:
+      - lambda: |-
+          id(enroll_any_failed) = false;
+
+  # NEU: Enroll-Ergebnis auf Matrix anzeigen (Smiley grün/rot)
+  - action: show_enroll_result
+    then:
+      - lambda: |-
+          ESP_LOGI("fm22x", "show_enroll_result called, enroll_any_failed=%s",
+                   id(enroll_any_failed) ? "true" : "false");
+
+          if (id(enroll_any_failed)) {
+            id(matrix_mode).publish_state("Smiley Sad");
+            auto call = id(led_matrix).turn_on();
+            call.set_rgb(1.0f, 0.0f, 0.0f);  // rot
+            call.perform();
+          } else {
+            id(matrix_mode).publish_state("Smiley Happy");
+            auto call = id(led_matrix).turn_on();
+            call.set_rgb(0.0f, 1.0f, 0.0f);  // grün
+            call.perform();
+          }
+
+globals:
+  # Lock, solange Greeting läuft → Radar darf Anzeige nicht überschreiben
+  - id: matrix_locked
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Anzeige-Zustand der Matrix:
+  # 0 = Blank / Aus
+  # 1 = Pulse (Person <4m)
+  # 2 = Happy (Person sehr nah)
+  # 3 = Greeting ("Hi Name")
+  # 4 = Sad (Unbekanntes Gesicht)
+  - id: display_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: enroll_any_failed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+#BLE-Tracker-Hub (nutzt das interne BT)
+#esp32_ble_tracker:
+
+# --------------------------------------------------------
+# UARTs: FM22x + LD2410
+# --------------------------------------------------------
+uart:
+  - id: uart_fm22x
+    rx_pin: GPIO18   # Grün TX Pin von FM225
+    tx_pin: GPIO19   # Gelb RX Pin von FM225
+    baud_rate: 115200
+
+  - id: uart_ld2410
+    rx_pin: GPIO16   # Gelb LD2410 TX
+    tx_pin: GPIO17   # Grün LD2410 RX
+    baud_rate: 256000
+    parity: NONE
+    stop_bits: 1
+
+# --------------------------------------------------------
+# HLK FM22x
+# --------------------------------------------------------
+hlk_fm22x:
+  uart_id: uart_fm22x
+  on_face_scan_invalid:
+    - lambda: |-
+        id(fm22x_scan_status).publish_state(
+          " Ungültig: " + error
+        );
+        // Wenn gerade Greeting läuft → nicht überschreiben
+        if (!id(matrix_locked)) {
+          id(matrix_set_sad).execute();
+        }
+    - homeassistant.event:
+        event: esphome.test_node_face_scan_invalid
+        data:
+          error: !lambda 'return error;'
+  on_face_scan_matched:
+    - lambda: |-
+        id(fm22x_scan_status).publish_state(
+          "Erkannt: " + name + " (ID " + to_string(face_id) + ")"
+        );
+        // Begrüßung auf der Matrix anzeigen
+        id(matrix_show_greeting).execute(name);
+
+    - homeassistant.event:
+        event: esphome.test_node_face_scan_matched
+        data:
+          face_id: !lambda 'return face_id;'
+          name: !lambda 'return name;'
+
+
+  on_face_scan_unmatched:
+    - lambda: |-
+        id(fm22x_scan_status).publish_state("Unbekanntes Gesicht");
+
+        // Wenn gerade Greeting läuft → nicht überschreiben
+        if (!id(matrix_locked)) {
+          id(matrix_set_sad).execute();
+        }
+    - homeassistant.event:
+        event: esphome.test_node_face_scan_unmatched
+
+
+  on_face_info:
+    - lambda: |-
+        id(fm22x_scan_status).publish_state(
+          "Tracking: yaw=" + to_string(yaw) +
+          " pitch=" + to_string(pitch) +
+          " roll=" + to_string(roll)
+        );    
+    - homeassistant.event:
+        event: esphome.test_node_face_info
+        data:
+          status: !lambda 'return status;'
+          left: !lambda 'return left;'
+          top: !lambda 'return top;'
+          right: !lambda 'return right;'
+          bottom: !lambda 'return bottom;'
+          yaw: !lambda 'return yaw;'
+          pitch: !lambda 'return pitch;'
+          roll: !lambda 'return roll;'
+  on_enrollment_done:
+    - lambda: |-
+        id(fm22x_enrollment_status).publish_state(
+          "OK: ID " + to_string(face_id) +
+          " / dir=" + to_string(direction)
+        );
+
+        // Enroll-Schritt erfolgreich → grünes Smiley
+        id(matrix_mode).publish_state("Smiley Happy");
+        auto call = id(led_matrix).turn_on();
+        call.set_rgb(0.0f, 1.0f, 0.0f);  // grün
+        call.perform();
+
+        // WICHTIG: hier NICHT enroll_any_failed anfassen
+    - homeassistant.event:
+        event: esphome.test_node_enrollment_done
+        data:
+          face_id: !lambda 'return face_id;'
+          direction: !lambda 'return direction;'
+
+  on_enrollment_failed:
+    - lambda: |-
+        id(fm22x_enrollment_status).publish_state(
+          "Fehler: " + error
+        );
+        id(enroll_any_failed) = true;
+
+        // Sofort visuell anzeigen, dass etwas schiefging
+        id(matrix_mode).publish_state("Smiley Sad");
+        auto call = id(led_matrix).turn_on();
+        call.set_rgb(1.0f, 0.0f, 0.0f);
+        call.perform();
+
+    - homeassistant.event:
+        event: esphome.test_node_enrollment_failed
+        data:
+          error: !lambda 'return error;'
+          
+# --------------------------------------------------------
+# LD2410 Hub
+# --------------------------------------------------------
+ld2410:
+  uart_id: uart_ld2410
+
+script:
+  - id: trigger_face_scan_from_ld2410
+    mode: single
+    then:
+      - logger.log: "LD2410: Ziel <= 35cm, triggere Face-Scan"
+      - hlk_fm22x.scan:
+      - delay: 3s
+
+  # Script: Greeting "Hi <Name>" für 20 Sekunden
+  # Setzt State = 3 (GREETING) und sperrt Radar-Updates (matrix_locked = true)
+  - id: matrix_show_greeting
+    mode: restart
+    parameters:
+      name: string
+    then:
+      - lambda: |-
+          id(matrix_locked) = true;
+          id(display_state) = 3;  // GREETING
+          std::string msg = "Hi " + name;
+          if (msg.length() > 16) {
+            msg = msg.substr(0, 16);
+          }
+          id(matrix_text).publish_state(msg);
+          id(matrix_mode).publish_state("Text");
+
+          // Nur Farbe setzen, Helligkeit kommt aus HA
+          auto call = id(led_matrix).turn_on();
+          call.set_rgb(0.0f, 1.0f, 0.0f);  // grün
+          call.perform();
+      - delay: 20s
+      - script.execute: matrix_set_blank   # danach wieder auf Blank
+
+  # ---------- State-Machine-Actions ----------
+
+  # Zustand 0: Blank / aus
+  - id: matrix_set_blank
+    mode: restart
+    then:
+      - lambda: |-
+          id(display_state) = 0;
+          id(matrix_locked) = false;
+          id(matrix_mode).publish_state("Blank");
+          auto call = id(led_matrix).turn_off();
+          call.perform();
+
+  # Zustand 1: Pulse (Person in Reichweite <4m)
+  - id: matrix_set_pulse
+    mode: restart
+    then:
+      - lambda: |-
+          id(display_state) = 1;
+          id(matrix_mode).publish_state("Pulse");
+          auto call = id(led_matrix).turn_on();
+          // Blau, Helligkeit bleibt wie in HA eingestellt
+          call.set_rgb(0.0f, 0.0f, 1.0f);
+          call.perform();
+
+  # Zustand 2: Happy (Person sehr nah ≤35 cm)
+  - id: matrix_set_happy
+    mode: restart
+    then:
+      - lambda: |-
+          id(display_state) = 2;
+          id(matrix_mode).publish_state("Smiley Happy");
+          auto call = id(led_matrix).turn_on();
+          // Grün
+          call.set_rgb(0.0f, 1.0f, 0.0f);
+          call.perform();
+
+  # Zustand 4: Sad (Unbekanntes Gesicht)
+  - id: matrix_set_sad
+    mode: restart
+    then:
+      - lambda: |-
+          id(matrix_locked) = true;
+          id(display_state) = 4;
+          id(matrix_mode).publish_state("Smiley Sad");
+          auto call = id(led_matrix).turn_on();
+          // Rot
+          call.set_rgb(1.0f, 0.0f, 0.0f);
+          call.perform();
+      - delay: 5s
+      - script.execute: matrix_set_blank   # danach wieder auf Blank
+
+
+sensor:
+  # HLK FM22x
+  - platform: hlk_fm22x
+    face_count:
+      name: "FM22x Face Count"
+    last_face_id:
+      name: "FM22x Last Face ID"
+    status:
+      name: "FM22x Status"
+
+  - platform: ld2410
+    moving_distance:
+      name: "LD2410 Moving Distance"
+    still_distance:
+      name: "LD2410 Still Distance"
+    detection_distance:
+      name: "LD2410 Detection Distance"
+      id: ld2410_detection_distance
+      on_value:
+        then:
+          - lambda: |-
+              // Wenn Radar deaktiviert oder Greeting läuft → nix tun
+              if (!id(ld2410_enabled).state) {
+                return;
+              }
+              if (id(matrix_locked)) {
+                return;
+              }
+
+              int new_state = id(display_state);
+
+              // x aus LD2410: deine bisherige Logik
+              if (x > 0 && x <= 35) {
+                // Sehr nah: HAPPY + Scan → State 2
+                new_state = 2;
+              } else if (x > 35 && x <= 400) {
+                // Im Annäherungsbereich: PULSE → State 1
+                new_state = 1;
+              } else {
+                // Niemand: BLANK → State 0
+                new_state = 0;
+              }
+
+              // Nur reagieren, wenn sich der State wirklich ändert
+              if (new_state == id(display_state)) {
+                return;
+              }
+
+              id(display_state) = new_state;
+
+              if (new_state == 2) {
+                // Happy-Nähe
+                id(matrix_set_happy).execute();
+                // Scan über Script (inkl. 3s-Sperre)
+                id(trigger_face_scan_from_ld2410).execute();
+              } else if (new_state == 1) {
+                // Pulse-Annäherung
+                id(matrix_set_pulse).execute();
+              } else {
+                // Blank / aus
+                id(matrix_set_blank).execute();
+              }
+
+
+
+text_sensor:
+  - platform: hlk_fm22x
+    version:
+      name: "FM22x Firmware"
+    last_face_name:
+      name: "FM22x Last Face Name"
+
+  - platform: template
+    name: "FM22x Scan Status"
+    id: fm22x_scan_status
+
+  - platform: template
+    name: "FM22x Enrollment Status"
+    id: fm22x_enrollment_status
+
+button:
+  - platform: template
+    name: "FM22x Scan"
+    id: fm22x_scan_button
+    icon: "mdi:face-recognition"
+    on_press:
+      then:
+        - hlk_fm22x.scan:
+  - platform: ld2410
+    factory_reset:
+      name: Factory reset
+    restart:
+      name: Restart
+    query_params:
+      name: Query params
+
+
+number:
+  - platform: ld2410
+    timeout:
+      name: Timeout
+    light_threshold:
+      name: Light threshold
+    max_move_distance_gate:
+      name: Max move distance gate
+    max_still_distance_gate:
+      name: Max still distance gate
+# --------------------------------------------------------
+#  Schalter
+# --------------------------------------------------------
+switch:
+  # Schalter für Dauer-Scan FM22x
+  - platform: template
+    name: "FM22x Dauer-Scan"
+    id: fm22x_continuous_scan
+    icon: "mdi:motion-sensor"
+    optimistic: true
+
+  # NEU: Schalter für Radar (LD2410-Trigger)
+  - platform: template
+    name: "LD2410 Radar aktiv"
+    id: ld2410_enabled
+    icon: "mdi:radar"
+    optimistic: true
+    #restore_mode: 
+
+# Optional: LD2410 Präsenz in HA + Extras
+  - platform: ld2410
+    engineering_mode:
+      name: "LD2410 Engineering Mode"
+    bluetooth:
+      name: "LD2410 Bluetooth"
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      name: "LD2410 Presence"
+      device_class: occupancy
+
+# --------------------------------------------------------
+# Alle 350 ms wird geprüft, ob der Switch an ist.
+# Wenn ja → ein scan.
+# --------------------------------------------------------
+interval:
+  - interval: 350ms
+    then:
+      - if:
+          condition:
+            switch.is_on: fm22x_continuous_scan
+          then:
+            - hlk_fm22x.scan:
+
+text:
+  - platform: template
+    id: matrix_text
+    name: "LED Matrix Text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 64
+
+select:
+  - platform: template
+    id: matrix_mode
+    name: "LED Matrix Mode"
+    optimistic: true
+    options:
+      - Text
+      - Arrow Up
+      - Arrow Down
+      - Arrow Left
+      - Arrow Right
+      - Smiley Happy
+      - Smiley Sad
+      - Smiley Wink
+      - Smiley Wow
+      - Center Dot
+      - Sand Uhr
+      - Tuer
+      - House
+      - X
+      - Big DOT
+      - Pulse
+      - Blank
+    initial_option: Text
+
+font:
+  - file: "fonts/6x8.ttf"
+    id: font_6x8
+    size: 8
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_matrix
+    name: "LED Matrix"
+    chipset: WS2812
+    pin: GPIO23
+    num_leds: 64
+    rgb_order: GRB
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    gamma_correct: 1.5
+    #brightness: 50%
+    icon: "mdi:dots-grid"
+
+
+
+display:
+  - platform: addressable_light
+    id: led_matrix_display
+    addressable_light_id: led_matrix
+    width: 8
+    height: 8
+    rotation: 270
+    #update_interval: 40ms
+
+    # Serpentine-Zickzack, gespiegelt gefixt
+    pixel_mapper: |-
+      if (y % 2 == 0) {
+        // gerade Zeile: rechts->links
+        return y * 8 + (7 - x);
+      } else {
+        // ungerade Zeile: links->rechts
+        return y * 8 + x;
+      }
+
+    lambda: |-
+      // Farbe + Helligkeit vom Light holen
+      auto cv = id(led_matrix).remote_values;
+      float r_f, g_f, b_f;
+      cv.as_rgb(&r_f, &g_f, &b_f, 0.0f, false);
+      Color on = Color(uint8_t(r_f * 255.0f), uint8_t(g_f * 255.0f), uint8_t(b_f * 255.0f));
+
+      auto mode = id(matrix_mode).current_option();
+      it.fill(Color::BLACK);
+
+      auto px = [&](int x, int y, Color c) {
+        if (x >= 0 && x < 8 && y >= 0 && y < 8) {
+          it.draw_pixel_at(x, y, c);
+        }
+      };
+
+      // -------- Text-Modus mit Scroll --------
+      if (mode == "Text") {
+        std::string msg = id(matrix_text).state;
+        if (msg.empty()) {
+          return;
+        }
+
+        int16_t text_width = msg.length() * 6;
+
+        static int16_t offset = 4;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t speed = 40;
+
+        if (now - last > speed) {
+          last = now;
+          offset--;
+        }
+
+        if (offset < -text_width) {
+          offset = 8;
+        }
+
+        it.print(offset, 0, id(font_6x8), on, msg.c_str());
+        return;
+      }
+
+      // =========================
+      //  Bisherige Symbole
+      // =========================
+
+      if (mode == "Arrow Up") {
+        px(3, 0, on); px(4, 0, on);
+        px(3, 1, on); px(4, 1, on);
+        px(2, 2, on); px(3, 2, on); px(4, 2, on); px(5, 2, on);
+        px(1, 3, on); px(2, 3, on); px(3, 3, on); px(4, 3, on); px(5, 3, on); px(6, 3, on);
+        px(3, 4, on); px(4, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        px(3, 6, on); px(4, 6, on);
+        return;
+      }
+
+      if (mode == "Arrow Down") {
+        px(3, 7, on); px(4, 7, on);
+        px(3, 6, on); px(4, 6, on);
+        px(2, 5, on); px(3, 5, on); px(4, 5, on); px(5, 5, on);
+        px(1, 4, on); px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on); px(6, 4, on);
+        px(3, 3, on); px(4, 3, on);
+        px(3, 2, on); px(4, 2, on);
+        px(3, 1, on); px(4, 1, on);
+        return;
+      }
+
+      if (mode == "Arrow Left") {
+        px(0, 3, on); px(0, 4, on);
+        px(1, 2, on); px(1, 3, on); px(1, 4, on); px(1, 5, on);
+        px(2, 3, on); px(3, 3, on); px(4, 3, on); px(5, 3, on);
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(6, 2, on); px(6, 5, on);
+        return;
+      }
+
+      if (mode == "Arrow Right") {
+        px(7, 3, on); px(7, 4, on);
+        px(6, 2, on); px(6, 3, on); px(6, 4, on); px(6, 5, on);
+        px(5, 3, on); px(4, 3, on); px(3, 3, on); px(2, 3, on);
+        px(5, 4, on); px(4, 4, on); px(3, 4, on); px(2, 4, on);
+        px(1, 2, on); px(1, 5, on);
+        return;
+      }
+
+       // ----- Smiley Happy (voller 8x8-Kopf) -----
+      if (mode == "Smiley Happy") {
+        // Außenring (Rahmen)
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);   // oben
+          px(x, 7, on);   // unten
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);   // links
+          px(7, y, on);   // rechts
+        }
+
+        // Augen
+        px(2, 2, on);
+        px(5, 2, on);
+
+        // Lächeln (leicht gebogen)
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        return;
+      }
+
+      // ----- Smiley Sad (voller Kopf, trauriger Mund) -----
+      if (mode == "Smiley Sad") {
+        // Außenring
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+
+        // Augen
+        px(2, 2, on);
+        px(5, 2, on);
+
+        // Trauermund (oben breit, unten schmal)
+        px(3, 4, on); px(4, 4, on);
+        px(2, 5, on); px(3, 5, on); px(4, 5, on); px(5, 5, on);
+        return;
+      }
+
+      // ----- Smiley Wink -----
+      if (mode == "Smiley Wink") {
+        // Außenring
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+
+        // Linkes Auge zu (Strich), rechtes Auge offen
+        px(2, 2, on); px(3, 2, on);    // „zugekniffenes“ Auge
+        px(5, 2, on);                  // rechtes Auge
+
+        // Freches Grinsen
+        px(1, 3, on); px(6, 3, on);
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        return;
+      }
+
+      // ----- Smiley Wow (Überrascht) -----
+      if (mode == "Smiley Wow") {
+        // Außenring
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+
+        // Große Augen
+        px(2, 2, on); px(2, 3, on);
+        px(5, 2, on); px(5, 3, on);
+
+        // "O"-Mund
+        px(3, 4, on); px(4, 4, on);
+        px(2, 5, on); px(5, 5, on);
+        px(3, 6, on); px(4, 6, on);
+        return;
+      }
+
+      if (mode == "Center Dot") {
+        px(3,3,on);
+        px(4,3,on);
+        px(3,4,on);
+        px(4,4,on);
+        return;
+      }
+
+
+      // Animierte Sanduhr (maximale Höhe, Sand läuft von oben nach unten)
+      if (mode == "Sand Uhr") {
+        // Animations-Phase: 0..5
+        static uint8_t phase = 0;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 150;   // Geschwindigkeit der Animation
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 6;      // 6 Frames
+        }
+
+        // Zuerst immer das Glas zeichnen (volle Größe)
+        // Oben (y=0) und unten (y=7) Balken
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        // Seiten und Verjüngung zur Mitte: klassisches Stundenglas
+        px(1,1,on); px(6,1,on);
+        px(2,2,on); px(5,2,on);
+        px(3,3,on); px(4,3,on);
+        px(3,4,on); px(4,4,on);
+        px(2,5,on); px(5,5,on);
+        px(1,6,on); px(6,6,on);
+
+        // Jetzt je nach Phase den Sand zeichnen (nur Innenbereich)
+        // Innenkoordinaten sind grob um die Mitte, wir nutzen die Fläche so gut wie möglich.
+
+        switch (phase) {
+          case 0:
+            // Oben fast voll, unten noch leer
+            // "Sandschale" oben
+            px(2,1,on); px(3,1,on); px(4,1,on); px(5,1,on);
+            px(3,2,on); px(4,2,on);
+            break;
+
+          case 1:
+            // Oben weniger, erster Sand in der Mitte
+            px(3,1,on); px(4,1,on);
+            px(3,3,on);               // „fallendes Korn“
+            break;
+
+          case 2:
+            // Oben fast leer, etwas mitten im Engpass, kleines Häufchen unten
+            px(3,2,on);
+            px(3,3,on); px(4,3,on);
+            px(3,5,on);
+            break;
+
+          case 3:
+            // Untere Schale halb voll
+            px(3,4,on); px(4,4,on);
+            px(2,5,on); px(3,5,on); px(4,5,on); px(5,5,on);
+            break;
+
+          case 4:
+            // Untere Schale voller
+            px(2,5,on); px(3,5,on); px(4,5,on); px(5,5,on);
+            px(3,6,on); px(4,6,on);
+            break;
+
+          case 5:
+            // Untere Schale maximal (für 8x8 sinnvoll)
+            for (int x = 2; x <= 5; x++) {
+              px(x,5,on);
+            }
+            px(3,6,on); px(4,6,on);
+            break;
+        }
+
+        return;
+      }
+
+      // Animierte Tür: maximal groß, öffnet sich nach rechts (Innen wird frei)
+      if (mode == "Tuer") {
+        // Animationsphase 0..4
+        static uint8_t phase = 0;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 140;   // Öffnungsgeschwindigkeit
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 5;      // 5 Frames (0..4)
+        }
+
+        // 1) Türrahmen maximal groß (immer sichtbar)
+        // Oben & unten
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);   // obere Kante
+          px(x, 7, on);   // untere Kante
+        }
+        // Seiten
+        for (int y = 1; y <= 6; y++) {
+          px(1, y, on);   // linke Zarge
+          px(6, y, on);   // rechte Zarge
+        }
+
+        // 2) Türblatt animieren
+        //
+        // Wir simulieren eine nach rechts aufschwingende Tür,
+        // indem das "Türblatt" von links kommend immer schmaler wird:
+        //
+        // phase 0: voll geschlossen → Breite 4 (x=2..5)
+        // phase 1: etwas geöffnet → Breite 3 (x=2..4)
+        // phase 2: weiter offen    → Breite 2 (x=2..3)
+        // phase 3: fast offen      → Breite 1 (x=2)
+        // phase 4: ganz offen      → kein Blatt mehr sichtbar
+
+        uint8_t max_width = 4;
+        uint8_t door_width = 0;
+
+        if (phase < 4) {
+          door_width = max_width - phase;  // 4,3,2,1
+        } else {
+          door_width = 0;                  // ganz offen
+        }
+
+        if (door_width > 0) {
+          int door_x_min = 2;
+          int door_x_max = door_x_min + door_width - 1;   // inklusiv
+
+          // Türblatt füllen
+          for (int y = 1; y <= 6; y++) {
+            for (int x = door_x_min; x <= door_x_max; x++) {
+              px(x, y, on);
+            }
+          }
+
+          // Türgriff (nur wenn Türblatt breit genug)
+          if (door_width >= 2) {
+            int handle_x = door_x_max;
+            int handle_y = 4;
+            px(handle_x, handle_y, on);
+          }
+        }
+
+        return;
+      }
+
+
+
+      // Shape 3:
+      // ........
+      // ....#...
+      // ...###..
+      // ..#####.
+      // .#######
+      // .##...##
+      // .##...##
+      // .#######
+      if (mode == "House") {
+        px(4,1,on);
+        px(3,2,on); px(4,2,on); px(5,2,on);
+        px(2,3,on); px(3,3,on); px(4,3,on); px(5,3,on); px(6,3,on);
+        for (int x = 1; x <= 7; x++) px(x,4,on);
+        px(1,5,on); px(2,5,on); px(6,5,on); px(7,5,on);
+        px(1,6,on); px(2,6,on); px(6,6,on); px(7,6,on);
+        for (int x = 1; x <= 7; x++) px(x,7,on);
+        return;
+      }
+
+      // Shape 4:
+      // ........
+      // #......#
+      // .#....#.
+      // ..#..#..
+      // ...##...
+      // ..#..#..
+      // .#....#.
+      // #......#
+      if (mode == "X") {
+        px(0,1,on); px(7,1,on);
+        px(1,2,on); px(6,2,on);
+        px(2,3,on); px(5,3,on);
+        px(3,4,on); px(4,4,on);
+        px(2,5,on); px(5,5,on);
+        px(1,6,on); px(6,6,on);
+        px(0,7,on); px(7,7,on);
+        return;
+      }
+
+      // Shape 5:
+      // ........
+      // ........
+      // ...##...
+      // ..####..
+      // ..####..
+      // ...##...
+      // ........
+      // ........
+      if (mode == "Big DOT") {
+        px(3,2,on); px(4,2,on);
+        px(2,3,on); px(3,3,on); px(4,3,on); px(5,3,on);
+        px(2,4,on); px(3,4,on); px(4,4,on); px(5,4,on);
+        px(3,5,on); px(4,5,on);
+        return;
+      }
+
+      // ----- Pulse: Kreis wächst aus der Mitte und verschwindet -----
+      if (mode == "Pulse") {
+        static uint8_t phase = 0;        // 0..4
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 120;    // Geschwindigkeit der Expansion
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 5;       // 0,1,2,3,4, dann wieder 0
+        }
+
+        // Phase 4 = komplett aus → nix zeichnen
+        if (phase == 4) {
+          return;
+        }
+
+        // Kreis-Radien pro Phase (in Pixel-Einheiten)
+        const float radii[4] = {0.0f, 1.4f, 2.3f, 3.1f};
+
+        float r = radii[phase];
+
+        // Mittelpunkt in der Mitte des 8x8 (zwischen 3 und 4)
+        const float cx = 3.5f;
+        const float cy = 3.5f;
+
+        for (int y = 0; y < 8; y++) {
+          for (int x = 0; x < 8; x++) {
+            float dx = float(x) - cx;
+            float dy = float(y) - cy;
+            float dist = sqrtf(dx * dx + dy * dy);
+
+            if (phase == 0) {
+              // kleiner Kernpunkt
+              if (dist < 0.8f) {
+                px(x, y, on);
+              }
+            } else {
+              // Ring: Toleranzband um Radius
+              if (fabsf(dist - r) < 0.5f) {
+                px(x, y, on);
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      // Blank: alles aus (it.fill war schon)
+      if (mode == "Blank") {
+        return;
+      }
+
+
+      // Blank: alles aus (it.fill war schon)
+      if (mode == "Blank") {
+        return;
+      }
