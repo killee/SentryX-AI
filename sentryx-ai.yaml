@@ -1,0 +1,131 @@
+substitutions:
+  devicename: sentryx-ai
+  friendly_name: "Haustüre Einlass"
+
+esphome:
+  name: ${devicename}
+  comment: "SentryX AI super duper Tür AI Eintritts und Begrüßungszauberei"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${devicename} Hotspot
+    password: !secret wifi_password
+
+captive_portal:
+
+logger:
+  level: DEBUG
+  baud_rate: 0        # keine serielle Ausgabe → UART0 frei
+
+ota:
+  password: !secret esp_password
+  platform: esphome
+
+external_components:
+  - source: github://pr#12195
+    components: [hlk_fm22x]
+    refresh: 1h
+
+globals:
+  - id: matrix_locked
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: display_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: enroll_any_failed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: door_latch_permanent
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+# UARTs: FM22x + LD2410
+uart:
+  - id: uart_fm22x
+    rx_pin: GPIO18
+    tx_pin: GPIO19
+    baud_rate: 115200
+  - id: uart_ld2410
+    rx_pin: GPIO16
+    tx_pin: GPIO17
+    baud_rate: 256000
+    parity: NONE
+    stop_bits: 1
+
+# --- API Actions (gerätsspezifisch) ---
+api:
+  encryption:
+    key: !secret api_key
+
+  actions:
+  - action: enroll
+    variables:
+      name: string
+      direction: int
+    then:
+      - hlk_fm22x.enroll:
+          name: !lambda 'return name;'
+          direction: !lambda 'return direction;'
+  - action: scan
+    then:
+      - hlk_fm22x.scan:
+  - action: delete
+    variables:
+      face_id: int
+    then:
+      - hlk_fm22x.delete:
+          face_id: !lambda 'return face_id;'
+  - action: delete_all
+    then:
+      - hlk_fm22x.delete_all:
+  - action: reset
+    then:
+      - hlk_fm22x.reset:
+  - action: reset_enroll_status
+    then:
+      - lambda: |-
+          id(enroll_any_failed) = false;
+  - action: show_enroll_result
+    then:
+      - lambda: |-
+          ESP_LOGI("fm22x", "show_enroll_result called, enroll_any_failed=%s",
+                   id(enroll_any_failed) ? "true" : "false");
+          if (id(enroll_any_failed)) {
+            id(matrix_mode).publish_state("Smiley Sad");
+            auto call = id(led_matrix).turn_on();
+            call.set_rgb(1.0f, 0.0f, 0.0f);  // rot
+            call.perform();
+          } else {
+            id(matrix_mode).publish_state("Smiley Happy");
+            auto call = id(led_matrix).turn_on();
+            call.set_rgb(0.0f, 1.0f, 0.0f);  // grün
+            call.perform();
+
+# --- Radar (LD2410, Radar-Sensoren, Radar-Schalter, Interval) ---
+<<: !include common/radar.yaml
+
+# --- FM22x (Komponente, FM22x-Sensoren, Textsensoren, Button, Trigger-Script) ---
+<<: !include common/fm22x.yaml
+
+# --- Matrix (Text, Mode-Select, Light, Display, Matrix-State-Scripts) ---
+<<: !include common/matrix.yaml
+
+# --- Tür-Relais / Dauer-Auf (Drücker-Relais und Tür-Logik) ---
+<<: !include common/door.yaml
+
+font:
+  - file: "fonts/6x8.ttf"
+    id: font_6x8
+    size: 8

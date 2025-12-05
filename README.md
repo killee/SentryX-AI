@@ -1,7 +1,7 @@
 # SentryX AI  
 Smart ESP32-based Door Access & Presence System  
 
-<img src="pics/logo_SentryX_AI.png" width="260" alt="SentryX AI Logo">
+<img src="pic/logo_SentryX_AI.png" width="260" alt="SentryX AI Logo">
 
 ---
 
