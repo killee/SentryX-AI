@@ -1,0 +1,111 @@
+uart:
+  - id: uart_ld2410
+    rx_pin: GPIO16   # Yellow: radar TX (LD2410)
+    tx_pin: GPIO17   # Green:  radar RX (LD2410)
+    baud_rate: 256000
+    parity: NONE
+    stop_bits: 1
+
+ld2410:
+  uart_id: uart_ld2410
+
+script:
+  - id: trigger_face_scan_from_ld2410
+    mode: single
+    then:
+      - logger.log: "Radar: Target <= 35 cm, triggering face scan"
+      - hlk_fm22x.scan:
+      - delay: 3s
+
+sensor:
+  - platform: ld2410
+    moving_distance:
+      name: "Radar Moving Target Distance ${entity_suffix}"
+    still_distance:
+      name: "Radar Still Target Distance ${entity_suffix}"
+    detection_distance:
+      name: "Radar Nearest Target Distance ${entity_suffix}"
+      id: ld2410_detection_distance
+      on_value:
+        then:
+          - lambda: |-
+              // If door latch is permanently open -> do not change display via radar
+              if (id(door_latch_permanent)) {
+                return;
+              }
+
+              // If radar is disabled or a greeting is running -> do nothing
+              if (!id(ld2410_enabled).state) {
+                return;
+              }
+              if (id(matrix_locked)) {
+                return;
+              }
+
+              int new_state = id(display_state);
+
+              // x is the LD2410 detection distance in cm
+              if (x > 0 && x <= 35) {
+                // Very close: HAPPY + scan -> State 2
+                new_state = 2;
+              } else if (x > 35 && x <= 400) {
+                // Within approach range: PULSE -> State 1
+                new_state = 1;
+              } else {
+                // No target: BLANK -> State 0
+                new_state = 0;
+              }
+
+              // Only react if the state actually changes
+              if (new_state == id(display_state)) {
+                return;
+              }
+
+              id(display_state) = new_state;
+
+              if (new_state == 2) {
+                // Close happy state
+                id(matrix_set_happy).execute();
+                // Trigger face scan via script (includes 3s lockout)
+                id(trigger_face_scan_from_ld2410).execute();
+              } else if (new_state == 1) {
+                // Approach pulse state
+                id(matrix_set_pulse).execute();
+              } else {
+                // Blank / off
+                id(matrix_set_blank).execute();
+              }
+
+button:
+  - platform: ld2410
+    factory_reset:
+      name: "Radar Factory Reset ${entity_suffix}"
+    restart:
+      name: "Radar Module Restart ${entity_suffix}"
+    query_params:
+      name: "Radar Diagnostics ${entity_suffix}"
+
+number:
+  - platform: ld2410
+    timeout:
+      name: "Radar Detection Timeout ${entity_suffix}"
+    light_threshold:
+      name: "Radar Light Threshold ${entity_suffix}"
+    max_move_distance_gate:
+      name: "Radar Max Moving Distance ${entity_suffix}"
+    max_still_distance_gate:
+      name: "Radar Max Still Distance ${entity_suffix}"
+
+switch:
+  # Radar specific switches
+  - platform: ld2410
+    engineering_mode:
+      name: "Radar Engineering Mode ${entity_suffix}"
+    bluetooth:
+      name: "Radar Bluetooth ${entity_suffix}"
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      name: "Radar Presence ${entity_suffix}"
+      device_class: occupancy

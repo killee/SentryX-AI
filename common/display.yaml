@@ -1,0 +1,505 @@
+script:
+  # Greeting "Hi <Name>" for 20 seconds
+  # Sets state = 3 (GREETING) and locks radar updates (matrix_locked = true)
+  - id: matrix_show_greeting
+    mode: restart
+    parameters:
+      name: string
+    then:
+      - lambda: |-
+          id(matrix_locked) = true;
+          id(display_state) = 3;  // GREETING
+          std::string msg = "Hi " + name;
+          if (msg.length() > 16) {
+            msg = msg.substr(0, 16);
+          }
+          id(matrix_text).publish_state(msg);
+          id(matrix_mode).publish_state("Text");
+          // Only set color; brightness is controlled from Home Assistant
+          auto call = id(led_matrix).turn_on();
+          call.set_rgb(0.0f, 1.0f, 0.0f);  // green
+          call.perform();
+      - delay: 20s
+      - script.execute: matrix_set_blank   # then back to blank
+
+  # State 0: Blank / off
+  - id: matrix_set_blank
+    mode: restart
+    then:
+      - lambda: |-
+          // If door latch is permanently open -> do not override matrix from here
+          if (id(door_latch_permanent)) {
+            return;
+          }
+          id(display_state) = 0;
+          id(matrix_locked) = false;
+          id(matrix_mode).publish_state("Blank");
+          auto call = id(led_matrix).turn_off();
+          call.perform();
+
+  # State 1: Pulse (person in range < 4 m)
+  - id: matrix_set_pulse
+    mode: restart
+    then:
+      - lambda: |-
+          // Door latch permanent-open has priority
+          if (id(door_latch_permanent)) {
+            return;
+          }
+          id(display_state) = 1;
+          id(matrix_mode).publish_state("Pulse");
+          auto call = id(led_matrix).turn_on();
+          // Blue, brightness stays as configured in Home Assistant
+          call.set_rgb(0.0f, 0.0f, 1.0f);
+          call.perform();
+
+  # State 2: Happy (person very close ≤ 35 cm)
+  - id: matrix_set_happy
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(door_latch_permanent)) {
+            return;
+          }
+          id(display_state) = 2;
+          id(matrix_mode).publish_state("Smiley Happy");
+          auto call = id(led_matrix).turn_on();
+          // Green
+          call.set_rgb(0.0f, 1.0f, 0.0f);
+          call.perform();
+
+  # State 4: Sad (unknown face or error)
+  - id: matrix_set_sad
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(door_latch_permanent)) {
+            return;
+          }
+          id(matrix_locked) = true;
+          id(display_state) = 4;
+          id(matrix_mode).publish_state("Smiley Sad");
+          auto call = id(led_matrix).turn_on();
+          // Red
+          call.set_rgb(1.0f, 0.0f, 0.0f);
+          call.perform();
+      - delay: 5s
+      - script.execute: matrix_set_blank   # then back to blank
+
+text:
+  - platform: template
+    id: matrix_text
+    name: "LED Matrix Text ${entity_suffix}"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 64
+
+select:
+  - platform: template
+    id: matrix_mode
+    name: "LED Matrix Mode ${entity_suffix}"
+    optimistic: true
+    options:
+      - Text
+      - Arrow Up
+      - Arrow Down
+      - Arrow Left
+      - Arrow Right
+      - Smiley Happy
+      - Smiley Sad
+      - Smiley Wink
+      - Smiley Wow
+      - Center Dot
+      - Hourglass
+      - Door
+      - House
+      - X
+      - Big DOT
+      - Pulse
+      - Blank
+    initial_option: Text
+
+font:
+  - file: "fonts/6x8.ttf"
+    id: font_6x8
+    size: 8
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_matrix
+    name: "LED Matrix ${entity_suffix}"
+    chipset: WS2812
+    pin: GPIO2
+    num_leds: 64
+    rgb_order: GRB
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    gamma_correct: 1.5
+    icon: "mdi:dots-grid"
+
+display:
+  - platform: addressable_light
+    id: led_matrix_display
+    addressable_light_id: led_matrix
+    width: 8
+    height: 8
+    rotation: 270
+
+    # Serpentine zigzag, mirrored/fixed mapping
+    pixel_mapper: |-
+      if (y % 2 == 0) {
+        // even row: right -> left
+        return y * 8 + (7 - x);
+      } else {
+        // odd row: left -> right
+        return y * 8 + x;
+      }
+
+    lambda: |-
+      // Take color + brightness from the light entity
+      auto cv = id(led_matrix).remote_values;
+      float r_f, g_f, b_f;
+      cv.as_rgb(&r_f, &g_f, &b_f, 0.0f, false);
+      Color on = Color(uint8_t(r_f * 255.0f), uint8_t(g_f * 255.0f), uint8_t(b_f * 255.0f));
+
+      auto mode = id(matrix_mode).current_option();
+      it.fill(Color::BLACK);
+
+      auto px = [&](int x, int y, Color c) {
+        if (x >= 0 && x < 8 && y >= 0 && y < 8) {
+          it.draw_pixel_at(x, y, c);
+        }
+      };
+
+      // -------- Text mode with scrolling --------
+      if (mode == "Text") {
+        std::string msg = id(matrix_text).state;
+        if (msg.empty()) {
+          return;
+        }
+
+        int16_t text_width = msg.length() * 6;
+
+        static int16_t offset = 4;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t speed = 40;
+
+        if (now - last > speed) {
+          last = now;
+          offset--;
+        }
+
+        if (offset < -text_width) {
+          offset = 8;
+        }
+
+        it.print(offset, 0, id(font_6x8), on, msg.c_str());
+        return;
+      }
+
+      // =========================
+      //  Icons
+      // =========================
+
+      // Arrow Up
+      if (mode == "Arrow Up") {
+        px(3, 0, on); px(4, 0, on);
+        px(3, 1, on); px(4, 1, on);
+        px(2, 2, on); px(3, 2, on); px(4, 2, on); px(5, 2, on);
+        px(1, 3, on); px(2, 3, on); px(3, 3, on); px(4, 3, on); px(5, 3, on); px(6, 3, on);
+        px(3, 4, on); px(4, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        px(3, 6, on); px(4, 6, on);
+        return;
+      }
+
+      // Arrow Down
+      if (mode == "Arrow Down") {
+        px(3, 7, on); px(4, 7, on);
+        px(3, 6, on); px(4, 6, on);
+        px(2, 5, on); px(3, 5, on); px(4, 5, on); px(5, 5, on);
+        px(1, 4, on); px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on); px(6, 4, on);
+        px(3, 3, on); px(4, 3, on);
+        px(3, 2, on); px(4, 2, on);
+        px(3, 1, on); px(4, 1, on);
+        return;
+      }
+
+      // Arrow Left
+      if (mode == "Arrow Left") {
+        px(0, 3, on); px(0, 4, on);
+        px(1, 2, on); px(1, 3, on); px(1, 4, on); px(1, 5, on);
+        px(2, 3, on); px(3, 3, on); px(4, 3, on); px(5, 3, on);
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(6, 2, on); px(6, 5, on);
+        return;
+      }
+
+      // Arrow Right
+      if (mode == "Arrow Right") {
+        px(7, 3, on); px(7, 4, on);
+        px(6, 2, on); px(6, 3, on); px(6, 4, on); px(6, 5, on);
+        px(5, 3, on); px(4, 3, on); px(3, 3, on); px(2, 3, on);
+        px(5, 4, on); px(4, 4, on); px(3, 4, on); px(2, 4, on);
+        px(1, 2, on); px(1, 5, on);
+        return;
+      }
+
+      // Smiley Happy
+      if (mode == "Smiley Happy") {
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+        px(2, 2, on);
+        px(5, 2, on);
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        return;
+      }
+
+      // Smiley Sad
+      if (mode == "Smiley Sad") {
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+        px(2, 2, on);
+        px(5, 2, on);
+        px(3, 4, on); px(4, 4, on);
+        px(2, 5, on); px(3, 5, on); px(4, 5, on); px(5, 5, on);
+        return;
+      }
+
+      // Smiley Wink
+      if (mode == "Smiley Wink") {
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+        px(2, 2, on); px(3, 2, on);
+        px(5, 2, on);
+        px(1, 3, on); px(6, 3, on);
+        px(2, 4, on); px(3, 4, on); px(4, 4, on); px(5, 4, on);
+        px(3, 5, on); px(4, 5, on);
+        return;
+      }
+
+      // Smiley Wow
+      if (mode == "Smiley Wow") {
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(0, y, on);
+          px(7, y, on);
+        }
+        px(2, 2, on); px(2, 3, on);
+        px(5, 2, on); px(5, 3, on);
+        px(3, 4, on); px(4, 4, on);
+        px(2, 5, on); px(5, 5, on);
+        px(3, 6, on); px(4, 6, on);
+        return;
+      }
+
+      // Center Dot
+      if (mode == "Center Dot") {
+        px(3, 3, on);
+        px(4, 3, on);
+        px(3, 4, on);
+        px(4, 4, on);
+        return;
+      }
+
+      // Hourglass (animated)
+      if (mode == "Hourglass") {
+        static uint8_t phase = 0;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 150;
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 6;
+        }
+
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        px(1, 1, on); px(6, 1, on);
+        px(2, 2, on); px(5, 2, on);
+        px(3, 3, on); px(4, 3, on);
+        px(3, 4, on); px(4, 4, on);
+        px(2, 5, on); px(5, 5, on);
+        px(1, 6, on); px(6, 6, on);
+
+        switch (phase) {
+          case 0:
+            px(2,1,on); px(3,1,on); px(4,1,on); px(5,1,on);
+            px(3,2,on); px(4,2,on);
+            break;
+          case 1:
+            px(3,1,on); px(4,1,on);
+            px(3,3,on);
+            break;
+          case 2:
+            px(3,2,on);
+            px(3,3,on); px(4,3,on);
+            px(3,5,on);
+            break;
+          case 3:
+            px(3,4,on); px(4,4,on);
+            px(2,5,on); px(3,5,on); px(4,5,on); px(5,5,on);
+            break;
+          case 4:
+            px(2,5,on); px(3,5,on); px(4,5,on); px(5,5,on);
+            px(3,6,on); px(4,6,on);
+            break;
+          case 5:
+            for (int x = 2; x <= 5; x++) {
+              px(x, 5, on);
+            }
+            px(3,6,on); px(4,6,on);
+            break;
+        }
+        return;
+      }
+
+      // Door (animated opening)
+      if (mode == "Door") {
+        static uint8_t phase = 0;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 140;
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 5;
+        }
+
+        for (int x = 1; x <= 6; x++) {
+          px(x, 0, on);
+          px(x, 7, on);
+        }
+        for (int y = 1; y <= 6; y++) {
+          px(1, y, on);
+          px(6, y, on);
+        }
+
+        uint8_t max_width = 4;
+        uint8_t door_width = (phase < 4) ? (max_width - phase) : 0;
+
+        if (door_width > 0) {
+          int door_x_min = 2;
+          int door_x_max = door_x_min + door_width - 1;
+
+          for (int y = 1; y <= 6; y++) {
+            for (int x = door_x_min; x <= door_x_max; x++) {
+              px(x, y, on);
+            }
+          }
+
+          if (door_width >= 2) {
+            int handle_x = door_x_max;
+            int handle_y = 4;
+            px(handle_x, handle_y, on);
+          }
+        }
+        return;
+      }
+
+      // House
+      if (mode == "House") {
+        px(4,1,on);
+        px(3,2,on); px(4,2,on); px(5,2,on);
+        px(2,3,on); px(3,3,on); px(4,3,on); px(5,3,on); px(6,3,on);
+        for (int x = 1; x <= 7; x++) px(x,4,on);
+        px(1,5,on); px(2,5,on); px(6,5,on); px(7,5,on);
+        px(1,6,on); px(2,6,on); px(6,6,on); px(7,6,on);
+        for (int x = 1; x <= 7; x++) px(x,7,on);
+        return;
+      }
+
+      // X
+      if (mode == "X") {
+        px(0,1,on); px(7,1,on);
+        px(1,2,on); px(6,2,on);
+        px(2,3,on); px(5,3,on);
+        px(3,4,on); px(4,4,on);
+        px(2,5,on); px(5,5,on);
+        px(1,6,on); px(6,6,on);
+        px(0,7,on); px(7,7,on);
+        return;
+      }
+
+      // Big DOT
+      if (mode == "Big DOT") {
+        px(3,2,on); px(4,2,on);
+        px(2,3,on); px(3,3,on); px(4,3,on); px(5,3,on);
+        px(2,4,on); px(3,4,on); px(4,4,on); px(5,4,on);
+        px(3,5,on); px(4,5,on);
+        return;
+      }
+
+      // Pulse: growing circle from center
+      if (mode == "Pulse") {
+        static uint8_t phase = 0;
+        static uint32_t last = 0;
+        const uint32_t now = millis();
+        const uint32_t step_ms = 120;
+
+        if (now - last > step_ms) {
+          last = now;
+          phase = (phase + 1) % 5;
+        }
+
+        if (phase == 4) {
+          return;
+        }
+
+        const float radii[4] = {0.0f, 1.4f, 2.3f, 3.1f};
+        float r = radii[phase];
+
+        const float cx = 3.5f;
+        const float cy = 3.5f;
+
+        for (int y = 0; y < 8; y++) {
+          for (int x = 0; x < 8; x++) {
+            float dx = float(x) - cx;
+            float dy = float(y) - cy;
+            float dist = sqrtf(dx * dx + dy * dy);
+
+            if (phase == 0) {
+              if (dist < 0.8f) {
+                px(x, y, on);
+              }
+            } else {
+              if (fabsf(dist - r) < 0.5f) {
+                px(x, y, on);
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      // Blank: everything off
+      if (mode == "Blank") {
+        return;
+      }

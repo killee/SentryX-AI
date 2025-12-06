@@ -1,10 +1,17 @@
+uart:
+  - id: uart_fm22x
+    rx_pin: GPIO18   # Green:  face module TX (FM22x)
+    tx_pin: GPIO19   # Yellow: face module RX (FM22x)
+    baud_rate: 115200
+
 hlk_fm22x:
   uart_id: uart_fm22x
   on_face_scan_invalid:
     - lambda: |-
         id(fm22x_scan_status).publish_state(
-          " Ungültig: " + error
+          "Scan invalid: " + error
         );
+        // If a greeting is currently running -> do not override display
         if (!id(matrix_locked)) {
           id(matrix_set_sad).execute();
         }
@@ -15,28 +22,28 @@ hlk_fm22x:
   on_face_scan_matched:
     - lambda: |-
         id(fm22x_scan_status).publish_state(
-          "Erkannt: " + name + " (ID " + to_string(face_id) + ")"
+          "Recognized: " + name + " (ID " + to_string(face_id) + ")"
         );
+        // Show greeting on the matrix
         id(matrix_show_greeting).execute(name);
     - homeassistant.event:
         event: esphome.test_node_face_scan_matched
         data:
           face_id: !lambda 'return face_id;'
           name: !lambda 'return name;'
-
   on_face_scan_unmatched:
     - lambda: |-
-        id(fm22x_scan_status).publish_state("Unbekanntes Gesicht");
+        id(fm22x_scan_status).publish_state("Unknown face detected");
+        // If a greeting is currently running -> do not override display
         if (!id(matrix_locked)) {
           id(matrix_set_sad).execute();
         }
     - homeassistant.event:
         event: esphome.test_node_face_scan_unmatched
-
   on_face_info:
     - lambda: |-
         id(fm22x_scan_status).publish_state(
-          "Tracking: yaw=" + to_string(yaw) +
+          "Tracking face: yaw=" + to_string(yaw) +
           " pitch=" + to_string(pitch) +
           " roll=" + to_string(roll)
         );
@@ -51,29 +58,30 @@ hlk_fm22x:
           yaw: !lambda 'return yaw;'
           pitch: !lambda 'return pitch;'
           roll: !lambda 'return roll;'
-
   on_enrollment_done:
     - lambda: |-
         id(fm22x_enrollment_status).publish_state(
-          "OK: ID " + to_string(face_id) +
+          "Enrollment OK: ID " + to_string(face_id) +
           " / dir=" + to_string(direction)
         );
+        // Enrollment step successful -> green happy smiley
         id(matrix_mode).publish_state("Smiley Happy");
         auto call = id(led_matrix).turn_on();
-        call.set_rgb(0.0f, 1.0f, 0.0f);
+        call.set_rgb(0.0f, 1.0f, 0.0f);  // green
         call.perform();
+        // Do NOT touch enroll_any_failed here
     - homeassistant.event:
         event: esphome.test_node_enrollment_done
         data:
           face_id: !lambda 'return face_id;'
           direction: !lambda 'return direction;'
-
   on_enrollment_failed:
     - lambda: |-
         id(fm22x_enrollment_status).publish_state(
-          "Fehler: " + error
+          "Enrollment error: " + error
         );
         id(enroll_any_failed) = true;
+        // Immediately show visually that something went wrong
         id(matrix_mode).publish_state("Smiley Sad");
         auto call = id(led_matrix).turn_on();
         call.set_rgb(1.0f, 0.0f, 0.0f);
@@ -83,43 +91,53 @@ hlk_fm22x:
         data:
           error: !lambda 'return error;'
 
-script:
-  - id: trigger_face_scan_from_ld2410
-    mode: single
-    then:
-      - logger.log: "LD2410: Ziel <= 35cm, triggere Face-Scan"
-      - hlk_fm22x.scan:
-      - delay: 3s
-
 sensor:
   - platform: hlk_fm22x
     face_count:
-      name: "FM22x Face Count"
+      name: "Face Count ${entity_suffix}"
     last_face_id:
-      name: "FM22x Last Face ID"
+      name: "Last Face ID ${entity_suffix}"
     status:
-      name: "FM22x Status"
+      name: "Face Module Status ${entity_suffix}"
 
 text_sensor:
   - platform: hlk_fm22x
     version:
-      name: "FM22x Firmware"
+      name: "Face Module Firmware ${entity_suffix}"
     last_face_name:
-      name: "FM22x Last Face Name"
+      name: "Last Face Name ${entity_suffix}"
 
   - platform: template
-    name: "FM22x Scan Status"
+    name: "Face Scan Status ${entity_suffix}"
     id: fm22x_scan_status
 
   - platform: template
-    name: "FM22x Enrollment Status"
+    name: "Face Enrollment Status ${entity_suffix}"
     id: fm22x_enrollment_status
 
 button:
   - platform: template
-    name: "FM22x Scan"
+    name: "Face Single Scan ${entity_suffix}"
     id: fm22x_scan_button
     icon: "mdi:face-recognition"
     on_press:
       then:
         - hlk_fm22x.scan:
+
+switch:
+  # Switch for face continuous scanning
+  - platform: template
+    name: "Face Continuous Scan ${entity_suffix}"
+    id: fm22x_continuous_scan
+    icon: "mdi:motion-sensor"
+    optimistic: true
+
+interval:
+  # Every 350 ms: if continuous scan is enabled -> trigger scan
+  - interval: 350ms
+    then:
+      - if:
+          condition:
+            switch.is_on: fm22x_continuous_scan
+          then:
+            - hlk_fm22x.scan:

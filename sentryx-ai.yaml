@@ -1,10 +1,12 @@
 substitutions:
   devicename: sentryx-ai
-  friendly_name: "Haustüre Einlass"
+  friendly_name: "SentryX AI"
+  device_name_suffix: "SentryX AI"
+  entity_suffix: ${device_name_suffix}
 
 esphome:
   name: ${devicename}
-  comment: "SentryX AI super duper Tür AI Eintritts und Begrüßungszauberei"
+  comment: "SentryX AI door access, presence and greeting system"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -22,7 +24,7 @@ captive_portal:
 
 logger:
   level: DEBUG
-  baud_rate: 0        # keine serielle Ausgabe → UART0 frei
+#  baud_rate: 0        # no serial output -> UART0 free
 
 ota:
   password: !secret esp_password
@@ -33,99 +35,135 @@ external_components:
     components: [hlk_fm22x]
     refresh: 1h
 
-globals:
-  - id: matrix_locked
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: display_state
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: enroll_any_failed
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: door_latch_permanent
-    type: bool
-    restore_value: yes
-    initial_value: 'false'
+packages:
+  display: !include common/display.yaml
+  radar: !include common/radar_ld2410.yaml
+  fm22x: !include common/fm22x.yaml
 
-# UARTs: FM22x + LD2410
-uart:
-  - id: uart_fm22x
-    rx_pin: GPIO18
-    tx_pin: GPIO19
-    baud_rate: 115200
-  - id: uart_ld2410
-    rx_pin: GPIO16
-    tx_pin: GPIO17
-    baud_rate: 256000
-    parity: NONE
-    stop_bits: 1
-
-# --- API Actions (gerätsspezifisch) ---
 api:
   encryption:
     key: !secret api_key
 
   actions:
-  - action: enroll
-    variables:
-      name: string
-      direction: int
-    then:
-      - hlk_fm22x.enroll:
-          name: !lambda 'return name;'
-          direction: !lambda 'return direction;'
-  - action: scan
-    then:
-      - hlk_fm22x.scan:
-  - action: delete
-    variables:
-      face_id: int
-    then:
-      - hlk_fm22x.delete:
-          face_id: !lambda 'return face_id;'
-  - action: delete_all
-    then:
-      - hlk_fm22x.delete_all:
-  - action: reset
-    then:
-      - hlk_fm22x.reset:
-  - action: reset_enroll_status
-    then:
+    - action: enroll
+      variables:
+        name: string
+        direction: int
+      then:
+        - hlk_fm22x.enroll:
+            name: !lambda 'return name;'
+            direction: !lambda 'return direction;'
+    - action: scan
+      then:
+        - hlk_fm22x.scan:
+    - action: delete
+      variables:
+        face_id: int
+      then:
+        - hlk_fm22x.delete:
+            face_id: !lambda 'return face_id;'
+    - action: delete_all
+      then:
+        - hlk_fm22x.delete_all:
+    - action: reset
+      then:
+        - hlk_fm22x.reset:
+    # Reset enrollment status before "full enroll"
+    - action: reset_enroll_status
+      then:
+        - lambda: |-
+            id(enroll_any_failed) = false;
+    # Show enrollment result on the matrix (green/red smiley)
+    - action: show_enroll_result
+      then:
+        - lambda: |-
+            ESP_LOGI("fm22x", "show_enroll_result called, enroll_any_failed=%s",
+                     id(enroll_any_failed) ? "true" : "false");
+
+            if (id(enroll_any_failed)) {
+              id(matrix_mode).publish_state("Smiley Sad");
+              auto call = id(led_matrix).turn_on();
+              call.set_rgb(1.0f, 0.0f, 0.0f);  // red
+              call.perform();
+            } else {
+              id(matrix_mode).publish_state("Smiley Happy");
+              auto call = id(led_matrix).turn_on();
+              call.set_rgb(0.0f, 1.0f, 0.0f);  // green
+              call.perform();
+            }
+
+globals:
+  # Lock while greeting is shown -> radar must not overwrite the display
+  - id: matrix_locked
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Display state of the matrix:
+  # 0 = Blank / Off
+  # 1 = Pulse (person < 4 m)
+  # 2 = Happy (person very close)
+  # 3 = Greeting ("Hi Name")
+  # 4 = Sad (unknown face)
+  - id: display_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: enroll_any_failed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Tracks whether the door latch is permanently open
+  # -> must not be overridden by short door openings
+  - id: door_latch_permanent
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+# --------------------------------------------------------
+#  Door relay + global switches
+# --------------------------------------------------------
+switch:
+  # Door latch relay (engage)
+  - platform: gpio
+    id: druecker
+    name: "Door Latch Relay ${entity_suffix}"
+    icon: "mdi:door-open"
+    pin:
+      number: GPIO5
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  # Door permanently open
+  - platform: template
+    name: "Door Latch Permanent ${entity_suffix}"
+    id: door_latch_permanent_switch
+    icon: "mdi:door-open"
+    optimistic: true
+    turn_on_action:
       - lambda: |-
-          id(enroll_any_failed) = false;
-  - action: show_enroll_result
-    then:
+          id(door_latch_permanent) = true;
+      - switch.turn_on: druecker
       - lambda: |-
-          ESP_LOGI("fm22x", "show_enroll_result called, enroll_any_failed=%s",
-                   id(enroll_any_failed) ? "true" : "false");
-          if (id(enroll_any_failed)) {
-            id(matrix_mode).publish_state("Smiley Sad");
-            auto call = id(led_matrix).turn_on();
-            call.set_rgb(1.0f, 0.0f, 0.0f);  // rot
-            call.perform();
-          } else {
-            id(matrix_mode).publish_state("Smiley Happy");
-            auto call = id(led_matrix).turn_on();
-            call.set_rgb(0.0f, 1.0f, 0.0f);  // grün
-            call.perform();
+          // Matrix: door permanently open -> show door icon in green
+          id(matrix_mode).publish_state("Door");
+          auto call = id(led_matrix).turn_on();
+          call.set_rgb(0.0f, 1.0f, 0.0f);  // green
+          call.perform();
+    turn_off_action:
+      - lambda: |-
+          id(door_latch_permanent) = false;
+      - switch.turn_off: druecker
+      - script.execute: matrix_set_blank
 
-# --- Radar (LD2410, Radar-Sensoren, Radar-Schalter, Interval) ---
-<<: !include common/radar.yaml
+  # Global radar (LD2410) enable switch
+  - platform: template
+    name: "Radar Enabled ${entity_suffix}"
+    id: ld2410_enabled
+    icon: "mdi:radar"
+    optimistic: true
 
-# --- FM22x (Komponente, FM22x-Sensoren, Textsensoren, Button, Trigger-Script) ---
-<<: !include common/fm22x.yaml
-
-# --- Matrix (Text, Mode-Select, Light, Display, Matrix-State-Scripts) ---
-<<: !include common/matrix.yaml
-
-# --- Tür-Relais / Dauer-Auf (Drücker-Relais und Tür-Logik) ---
-<<: !include common/door.yaml
-
-font:
-  - file: "fonts/6x8.ttf"
-    id: font_6x8
-    size: 8
+# Note: all further blocks (UART, sensors, scripts, display, etc.)
+# are defined in the modules under common/*.yaml
