@@ -1,0 +1,18 @@
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: ${devicename}
+    password: !secret wifi_password
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+# in the main file -> individual encryption key
+
+ota:
+  platform: esphome
+  password: !secret esp_password

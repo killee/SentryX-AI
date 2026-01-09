@@ -3,10 +3,15 @@ substitutions:
   friendly_name: "SentryX AI"
   device_name_suffix: "SentryX AI"
   entity_suffix: ${device_name_suffix}
+  
 
 esphome:
   name: ${devicename}
   comment: "SentryX AI door access, presence and greeting system"
+  on_boot:
+    priority: -10
+    then:
+      - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -30,15 +35,20 @@ ota:
   password: !secret esp_password
   platform: esphome
 
-external_components:
-  - source: github://pr#12195
-    components: [hlk_fm22x]
-    refresh: 1h
+psram:
+  mode: octal
+  speed: 80MHz
+
+# external_components:
+#   - source: github://pr#12195
+#     components: [hlk_fm22x]
+#     refresh: 1h
 
 packages:
   display: !include common/display.yaml
   radar: !include common/radar_ld2410.yaml
   fm22x: !include common/fm22x.yaml
+  audio_i2s: !include common/audio_i2s.yaml
 
 api:
   encryption:
@@ -165,5 +175,4 @@ switch:
     icon: "mdi:radar"
     optimistic: true
 
-# Note: all further blocks (UART, sensors, scripts, display, etc.)
-# are defined in the modules under common/*.yaml
+#

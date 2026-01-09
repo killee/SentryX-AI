@@ -1,0 +1,86 @@
+http_request:
+  # Für Home Assistant TTS/Media oft erforderlich (HTTPS, interne Hosts)
+  timeout: 15s
+  verify_ssl: false
+
+i2s_audio:
+  - id: i2s_bus_0
+    i2s_bclk_pin: GPIO12
+    i2s_lrclk_pin: GPIO13
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker_0
+    i2s_audio_id: i2s_bus_0
+    dac_type: external
+    i2s_dout_pin:
+      number: GPIO14
+    channel: mono
+
+media_player:
+  - platform: speaker
+    id: sentryx_media_player
+    #codec_support_enabled: false
+    buffer_size: 500000
+    name: "Speaker ${entity_suffix}"
+    announcement_pipeline:
+      speaker: i2s_speaker_0
+    # Optional, aber empfehlenswert: während Ausgabe Wake-Word pausieren,
+    # damit der Mic-Pfad sich nicht selbst triggert/überlappt.
+    on_announcement:
+      - micro_wake_word.stop
+    on_idle:
+      - micro_wake_word.start
+    volume_increment: 0.05
+    volume_min: 0.0
+    volume_max: 1.0
+
+
+microphone:
+  - platform: i2s_audio
+    id: sentryx_mic
+    i2s_audio_id: i2s_bus_0
+    i2s_din_pin: GPIO11
+    adc_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: left
+
+micro_wake_word:
+  id: mww
+  models:
+    - okay_nabu
+    - hey_jarvis
+    - hey_mycroft
+  on_wake_word_detected:
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone: sentryx_mic
+  media_player: sentryx_media_player
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  # Optional: Wake-Word nach jeder Interaktion wieder scharf schalten
+  on_end:
+    - micro_wake_word.start
+  on_client_connected:
+    - micro_wake_word.start
+  on_client_disconnected:
+    - micro_wake_word.stop
+
+# Optionaler Komfort aus dem Beispiel (NICHT nötig) wäre z.B. ein Mute-Switch:
+switch:
+  - platform: template
+    name: "Mute ${entity_suffix}"
+    id: mute
+    optimistic: true
+    on_turn_on:
+      - microphone.mute
+      - micro_wake_word.stop
+    on_turn_off:
+      - microphone.unmute
+      - micro_wake_word.start

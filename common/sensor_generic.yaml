@@ -1,0 +1,14 @@
+sensor:
+  - platform: wifi_signal
+    name: ${devicename} WiFi Signal Sensor
+    update_interval: 60s
+
+binary_sensor:
+  - platform: status
+    name: ${devicename} online
+
+text_sensor:
+  - platform: template
+    name: ${devicename} Uptime Human Readable
+    id: uptime_human
+    icon: mdi:clock-start
